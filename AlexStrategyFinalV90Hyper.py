@@ -86,11 +86,26 @@ class AlexStrategyFinalV9Hyper(IStrategy):
 
     # ROI table:
     minimal_roi = {
-         "0": 0.239,
-      "79": 0.058,
-      "231": 0.029,
-      "543": 0
+        # "0": 0.239,
+        # "79": 0.058,
+        # "231": 0.029,
+        # "543": 0
     }
+    
+    # To hyperopt the initial value, just hyperopt minimal_roi and copy the values here, then disable the hyperoptable minimal_roi.
+    roi_default = {
+        "0": 0.239,
+        "79": 0.058,
+        "231": 0.029,
+        "543": 0
+    }
+    
+    pair_self_controller = {}
+    
+    can_two_side = BooleanParameter(default=False, space="sell")
+    self_roi_change_rate = DecimalParameter(0.001, 0.05, default=0.01, space="sell", decimals=3, optimize=True)
+    self_roi_penalty_factor = DecimalParameter(0.1, 10, default=1, space="sell", decimals=1, optimize=True)
+    self_roi_0_limit = DecimalParameter(0.01, 0.5, default=0.05, space="sell", decimals=2, optimize=True)
 
     # Stoploss:
     stoploss = -0.305  # Were letting the model decide when to sell
@@ -410,21 +425,80 @@ class AlexStrategyFinalV9Hyper(IStrategy):
 #     stoploss = -1
 
 
-#     def custom_exit(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
-#                     current_profit: float, **kwargs):
+    def custom_exit(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
+                    current_profit: float, **kwargs):
+        
+        # Determine the direction of the trade
+        direction = 'all' if self.can_two_side.value else ('short' if trade.is_short else 'long')
+        
+        # Initialize pair_self_controller for each pair
+        if pair not in self.pair_self_controller:
+            self.pair_self_controller[pair] = {}
 
-#         tag = super().custom_sell(pair, trade, current_time, current_rate, current_profit, **kwargs)
-#         if tag:
-#             return tag
+        if direction not in self.pair_self_controller[pair]:
+            self.pair_self_controller[pair][direction] = {
+                'self_roi': self.roi_default.copy(),
+                'self_total_count': 0
+            }
+            
+        # Get all closed trades for the pair
+        trades_origin = Trade.get_trades_proxy(pair=pair, is_open=False)
 
-#         entry_tag = 'empty'
-#         if hasattr(trade, 'entry_tag') and trade.entry_tag is not None:
-#             entry_tag = trade.entry_tag
-
-#         if current_profit <= -0.35:
-#             return f'stop_loss ({entry_tag})'
-
-#         return None
+        # Sort the trade list by close date
+        trades = sorted(trades_origin, key=lambda trade: trade.close_date)
+            
+        # Check if there are new closed trades
+        need_change = len(trades) > self.pair_self_controller[pair][direction]['self_total_count']
+        
+        if need_change:
+            # If the last trade was exited using 'self_roi' (indicating a profit)
+            if trades[-1].exit_reason == "self_roi":
+                # Modify the ROI table to seek greater profits
+                profit = trades[-1].close_profit
+                # Find out which stage of ROI it might have exited at
+                for minutes, roi in sorted(self.pair_self_controller[pair][direction]['self_roi'].items(), key=lambda x: int(x[0])):
+                    # Increase the profit threshold for those stages to expect greater profits next time
+                    if profit >= roi:
+                        self.pair_self_controller[pair][direction]['self_roi'][minutes] += self.self_roi_change_rate.value
+                        # The ROI for the 0th minute should not be less than the limit value
+                        if self.pair_self_controller[pair][direction]['self_roi']['0'] < 0.05:
+                            self.pair_self_controller[pair][direction]['self_roi']['0'] = self.self_roi_0_limit.value
+                        # Print information
+                        # print(f"Modified ROI table for {pair}({direction}): Increased threshold for {minutes} minutes to {self.pair_self_controller[pair][direction]['self_roi'][minutes]}")
+                    # Decrease the profit threshold for stages not reached to expect quicker profits next time
+                    else:
+                        self.pair_self_controller[pair][direction]['self_roi'][minutes] -= self.self_roi_change_rate.value
+                        if self.pair_self_controller[pair][direction]['self_roi'][minutes] < 0:
+                            self.pair_self_controller[pair][direction]['self_roi'][minutes] = 0.01
+                        # The ROI for the 0th minute should not be less than the limit value
+                        if self.pair_self_controller[pair][direction]['self_roi']['0'] < 0.05:
+                            self.pair_self_controller[pair][direction]['self_roi']['0'] = self.self_roi_0_limit.value
+                        # Print information
+                        # print(f"Modified ROI table for {pair}({direction}): Decreased threshold for {minutes} minutes to {self.pair_self_controller[pair][direction]['self_roi'][minutes]}")
+            # If the trade was a loss
+            else:
+                profit = trades[-1].close_profit
+                if(profit < 0):
+                    # Decrease the thresholds of self_roi (not less than 0) to seek more stable profits
+                    for minutes in self.pair_self_controller[pair][direction]['self_roi']:
+                        self.pair_self_controller[pair][direction]['self_roi'][minutes] -= self.self_roi_change_rate.value * self.self_roi_penalty_factor.value
+                        if self.pair_self_controller[pair][direction]['self_roi'][minutes] < 0:
+                            self.pair_self_controller[pair][direction]['self_roi'][minutes] = 0.01
+                        # The ROI for the 0th minute should not be less than the limit value
+                            if self.pair_self_controller[pair][direction]['self_roi']['0'] < 0.05:
+                                self.pair_self_controller[pair][direction]['self_roi']['0'] = self.self_roi_0_limit.value
+                        # Print information
+                        # print(f"Modified ROI table for {pair}({direction}): Decreased threshold for {minutes} minutes to {self.pair_self_controller[pair][direction]['self_roi'][minutes]}")
+                
+                    
+            # Refresh self_total_count
+            self.pair_self_controller[pair][direction]['self_total_count'] = len(trades)
+            
+        # Decide whether to issue an exit signal based on the self_roi attribute
+        hold_minutes = (current_time - trade.open_date_utc).total_seconds() / 60
+        for minutes, roi in sorted(self.pair_self_controller[pair][direction]['self_roi'].items(), key=lambda x: int(x[0])):
+            if hold_minutes >= int(minutes) and current_profit >= roi:
+                return 'self_roi'
 
 #     def confirm_trade_exit(self, pair: str, trade: Trade, order_type: str, amount: float,
 #                            rate: float, time_in_force: str, exit_reason: str,
